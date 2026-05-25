@@ -56,3 +56,10 @@ dmypy.json
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Workspace and generated_tools directories - keep folders only
+workspace/*
+!workspace/.gitkeep
+generated_tools/*
+!generated_tools/.gitkeep
+
