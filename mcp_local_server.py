@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import os
+import ipaddress
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from mcp.server.fastmcp import FastMCP
 
@@ -21,6 +27,14 @@ ALLOWED_COMMANDS = {
     "python3",
     "pytest",
 }
+
+PACKAGE_SPEC_PATTERN = re.compile(
+    r"[A-Za-z0-9_.-]+"
+    r"(?:\[[A-Za-z0-9_,.-]+\])?"
+    r"(?:(?:==|>=|<=|~=|!=|>|<)[A-Za-z0-9_.!*+:-]+)?"
+)
+PRIVATE_HOSTNAMES = {"localhost", "localhost.localdomain"}
+USER_AGENT = "local-ollama-mcp-agent/0.1"
 
 mcp = FastMCP("local-agent-tools")
 
@@ -50,6 +64,125 @@ def compact_result(stdout: str, stderr: str, returncode: int) -> dict[str, Any]:
         "returncode": returncode,
         "stdout": stdout[-8000:],
         "stderr": stderr[-8000:],
+    }
+
+
+def validate_package_spec(package: str) -> str:
+    package = package.strip()
+    if not PACKAGE_SPEC_PATTERN.fullmatch(package):
+        raise ValueError(f"Invalid package spec: {package}")
+    return package
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        data = data.strip()
+        if data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return re.sub(r"\s+", " ", " ".join(self.parts)).strip()
+
+
+class DuckDuckGoResultParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: list[dict[str, str]] = []
+        self._href: str | None = None
+        self._text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        attr_map = dict(attrs)
+        classes = (attr_map.get("class") or "").split()
+        if "result__a" in classes:
+            self._href = attr_map.get("href")
+            self._text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._href is None:
+            return
+        title = re.sub(r"\s+", " ", " ".join(self._text_parts)).strip()
+        if title:
+            self.results.append({"title": title, "url": self._href})
+        self._href = None
+        self._text_parts = []
+
+
+def validate_public_url(url: str) -> str:
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only http and https URLs are allowed")
+    if not parsed.hostname:
+        raise ValueError("URL must include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with credentials are not allowed")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in PRIVATE_HOSTNAMES or hostname.endswith(".local"):
+        raise ValueError(f"Private hostnames are not allowed: {hostname}")
+
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return url
+
+    if not address.is_global:
+        raise ValueError(f"Private or non-global IP addresses are not allowed: {hostname}")
+    return url
+
+
+def strip_html(text: str) -> str:
+    parser = TextExtractor()
+    parser.feed(text)
+    return parser.text()
+
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
+        validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def normalize_duckduckgo_url(href: str) -> str:
+    absolute = urljoin("https://duckduckgo.com", href)
+    parsed = urlparse(absolute)
+    params = parse_qs(parsed.query)
+    if parsed.netloc.endswith("duckduckgo.com") and "uddg" in params:
+        return params["uddg"][0]
+    return absolute
+
+
+def fetch_public_url_text(url: str, max_chars: int, readable_html: bool) -> dict[str, Any]:
+    url = validate_public_url(url)
+    max_chars = max(500, min(max_chars, 30000))
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    opener = build_opener(SafeRedirectHandler)
+
+    with opener.open(request, timeout=15) as response:
+        final_url = validate_public_url(response.geturl())
+        content_type = response.headers.get("content-type", "")
+        charset = response.headers.get_content_charset() or "utf-8"
+        raw = response.read(max_chars * 4)
+
+    text = raw.decode(charset, errors="replace")
+    if readable_html and "html" in content_type:
+        text = strip_html(text)
+
+    return {
+        "url": final_url,
+        "content_type": content_type,
+        "text": text[:max_chars],
     }
 
 
@@ -139,6 +272,62 @@ def run_command(command: list[str], cwd: str = ".") -> dict[str, Any]:
         },
     )
     return compact_result(completed.stdout, completed.stderr, completed.returncode)
+
+
+@mcp.tool()
+def uv_add(package: str) -> dict[str, Any]:
+    """Add one Python package dependency to this project using uv."""
+    package = validate_package_spec(package)
+    uv_path = shutil.which("uv")
+    if uv_path is None:
+        raise ValueError("uv executable was not found in PATH")
+
+    completed = subprocess.run(
+        [uv_path, "add", package],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+        },
+    )
+    return compact_result(completed.stdout, completed.stderr, completed.returncode)
+
+
+@mcp.tool()
+def fetch_url(url: str, max_chars: int = 8000) -> dict[str, Any]:
+    """Fetch a public HTTP(S) URL and return readable text content."""
+    return fetch_public_url_text(url, max_chars=max_chars, readable_html=True)
+
+
+@mcp.tool()
+def web_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
+    """Search the web and return public result titles and URLs."""
+    query = query.strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    max_results = max(1, min(max_results, 10))
+    search_url = f"https://duckduckgo.com/html/?{urlencode({'q': query})}"
+    payload = fetch_public_url_text(search_url, max_chars=30000, readable_html=False)
+
+    parser = DuckDuckGoResultParser()
+    parser.feed(payload["text"])
+
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for result in parser.results:
+        try:
+            url = validate_public_url(normalize_duckduckgo_url(result["url"]))
+        except ValueError:
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        results.append({"title": result["title"], "url": url})
+        if len(results) >= max_results:
+            break
+    return results
 
 
 @mcp.tool()

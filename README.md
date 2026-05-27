@@ -45,6 +45,20 @@ venv/bin/python local_ollama_mcp_agent.py --model qwen2.5-coder:7b "列出目前
 venv/bin/python local_ollama_mcp_agent.py --model qwen2.5-coder:7b
 ```
 
+HTTP server：
+
+```bash
+venv/bin/python local_agent_server.py --host 127.0.0.1 --port 8765
+```
+
+呼叫 agent：
+
+```bash
+curl -s http://127.0.0.1:8765/agent/message \
+  -H 'content-type: application/json' \
+  -d '{"message":"列出 workspace 的檔案","trace":true}'
+```
+
 ## 第一階段工具
 
 目前 MCP server 提供：
@@ -55,6 +69,9 @@ venv/bin/python local_ollama_mcp_agent.py --model qwen2.5-coder:7b
 - `write_file`
 - `search_files`
 - `run_command`
+- `uv_add`
+- `web_search`
+- `fetch_url`
 
 `read_file`、`write_file`、`search_files`、`run_command` 都限制在 `agent_workspace/` 裡。
 
@@ -65,6 +82,10 @@ venv/bin/python local_ollama_mcp_agent.py --model qwen2.5-coder:7b
 - `python`
 - `python3`
 - `pytest`
+
+`uv_add` 是專用依賴安裝工具，會在專案根目錄執行 `uv add <package>`，並只接受單一保守格式的 package spec，例如 `pydantic`、`pytest==9.0.3`、`requests[socks]`。
+
+`web_search` 和 `fetch_url` 提供連網能力，只允許公開 `http`/`https` URL，會拒絕 localhost、內網 IP、`.local` host 和帶帳密的 URL。
 
 ## 第二階段：自製工具與偵錯
 
