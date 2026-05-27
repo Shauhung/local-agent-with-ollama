@@ -3,7 +3,9 @@ import pytest
 from local_ollama_mcp_agent import (
     ACTION_RESPONSE_FORMAT,
     ActionValidationError,
+    ToolSpec,
     build_ollama_payload,
+    build_system_prompt,
     parse_agent_action,
 )
 
@@ -94,3 +96,19 @@ def test_action_response_format_limits_action_types() -> None:
     }
 
     assert action_types == {"tool_call", "final"}
+
+
+def test_system_prompt_treats_generated_tools_as_review_gated() -> None:
+    prompt = build_system_prompt(
+        [
+            ToolSpec(
+                name="create_tool_file",
+                description="Create generated tool",
+                input_schema={},
+            )
+        ]
+    )
+
+    assert "generated_tools 是實驗區" in prompt
+    assert "不能假設 generated_tools 裡的工具已經能在一般任務中直接使用" in prompt
+    assert "需要人工 review/promote 後才可正式使用" in prompt

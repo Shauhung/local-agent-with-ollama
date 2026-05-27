@@ -179,7 +179,8 @@ def build_system_prompt(tools: list[ToolSpec]) -> str:
 - 只有需要工具時才呼叫工具。
 - reason 必須簡短，只說明可觀察的下一步決策依據，不要展開完整推理過程。
 - 讀寫檔案時使用相對於 agent_workspace 的路徑。
-- 進階自製工具練習只能寫到 generated_tools。
+- generated_tools 是實驗區。你可以在這裡建立工具與測試，但不能假設 generated_tools 裡的工具已經能在一般任務中直接使用。
+- 當 generated tool 的測試通過後，請停止並回覆使用者，說明工具已完成、測試狀態，以及需要人工 review/promote 後才可正式使用。
 - 需要最新或外部資訊時，先用 web_search 找公開來源，再用 fetch_url 讀取需要的頁面。
 - 如果工具執行失敗，根據錯誤修正下一步。
 """.strip()
