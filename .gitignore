@@ -45,6 +45,7 @@ env/
 # Project specific
 /test/
 *.log
+agent_history.sqlite3
 .pytest_cache/
 .coverage
 htmlcov/
@@ -62,4 +63,3 @@ workspace/*
 !workspace/.gitkeep
 generated_tools/*
 !generated_tools/.gitkeep
-

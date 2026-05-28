@@ -3,14 +3,30 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from agent_history import ConversationHistory, validate_session_id
 from local_ollama_mcp_agent import DEFAULT_MODEL, run_agent
+from local_ollama_mcp_agent import build_final_history_message
 
 
-def parse_agent_request(payload: dict[str, Any]) -> tuple[str, str, bool]:
+DEFAULT_SESSION_ID = "default"
+DEFAULT_HISTORY_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class AgentRequest:
+    message: str
+    model: str
+    trace_enabled: bool
+    session_id: str
+    history_limit: int
+
+
+def parse_agent_request(payload: dict[str, Any]) -> AgentRequest:
     message = payload.get("message")
     if not isinstance(message, str) or not message.strip():
         raise ValueError("message must be a non-empty string")
@@ -23,7 +39,22 @@ def parse_agent_request(payload: dict[str, Any]) -> tuple[str, str, bool]:
     if not isinstance(trace_enabled, bool):
         raise ValueError("trace must be a boolean")
 
-    return message.strip(), model.strip(), trace_enabled
+    session_id = payload.get("session_id", DEFAULT_SESSION_ID)
+    if not isinstance(session_id, str):
+        raise ValueError("session_id must be a string")
+
+    history_limit = payload.get("history_limit", DEFAULT_HISTORY_LIMIT)
+    if not isinstance(history_limit, int):
+        raise ValueError("history_limit must be an integer")
+    history_limit = max(0, min(history_limit, 50))
+
+    return AgentRequest(
+        message=message.strip(),
+        model=model.strip(),
+        trace_enabled=trace_enabled,
+        session_id=validate_session_id(session_id),
+        history_limit=history_limit,
+    )
 
 
 class AgentRequestHandler(BaseHTTPRequestHandler):
@@ -45,13 +76,31 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         try:
             payload = self.read_json()
-            message, model, trace_enabled = parse_agent_request(payload)
+            agent_request = parse_agent_request(payload)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
         try:
-            answer = asyncio.run(run_agent(message, model, trace_enabled=trace_enabled))
+            history = ConversationHistory()
+            history_messages = history.load_recent_messages(
+                agent_request.session_id,
+                agent_request.history_limit,
+            )
+            answer = asyncio.run(
+                run_agent(
+                    agent_request.message,
+                    agent_request.model,
+                    trace_enabled=agent_request.trace_enabled,
+                    history_messages=history_messages,
+                )
+            )
+            history.append_message(agent_request.session_id, "user", agent_request.message)
+            history.append_message(
+                agent_request.session_id,
+                "assistant",
+                build_final_history_message(answer),
+            )
         except Exception as exc:
             self.send_json(
                 {"error": f"agent failed: {exc}"},
@@ -59,7 +108,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self.send_json({"answer": answer, "model": model})
+        self.send_json(
+            {
+                "answer": answer,
+                "model": agent_request.model,
+                "session_id": agent_request.session_id,
+            }
+        )
 
     def read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("content-length", "0"))

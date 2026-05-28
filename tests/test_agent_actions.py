@@ -90,10 +90,7 @@ def test_build_ollama_payload_uses_structured_output_schema() -> None:
 
 
 def test_action_response_format_limits_action_types() -> None:
-    action_types = {
-        variant["properties"]["type"]["const"]
-        for variant in ACTION_RESPONSE_FORMAT["oneOf"]
-    }
+    action_types = set(ACTION_RESPONSE_FORMAT["discriminator"]["mapping"])
 
     assert action_types == {"tool_call", "final"}
 
@@ -112,3 +109,17 @@ def test_system_prompt_treats_generated_tools_as_review_gated() -> None:
     assert "generated_tools 是實驗區" in prompt
     assert "不能假設 generated_tools 裡的工具已經能在一般任務中直接使用" in prompt
     assert "需要人工 review/promote 後才可正式使用" in prompt
+
+
+def test_system_prompt_prefers_stock_quote_tool_for_latest_prices() -> None:
+    prompt = build_system_prompt(
+        [
+            ToolSpec(
+                name="get_stock_quote",
+                description="Get latest stock quote",
+                input_schema={},
+            )
+        ]
+    )
+
+    assert "詢問今日或最新股價時，優先使用 get_stock_quote" in prompt

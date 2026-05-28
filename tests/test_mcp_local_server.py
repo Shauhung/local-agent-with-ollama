@@ -1,6 +1,11 @@
 import pytest
 
-from mcp_local_server import normalize_duckduckgo_url, validate_package_spec, validate_public_url
+from mcp_local_server import (
+    normalize_duckduckgo_url,
+    validate_package_spec,
+    validate_public_url,
+    validate_stock_symbol,
+)
 
 
 @pytest.mark.parametrize(
@@ -66,3 +71,14 @@ def test_normalize_duckduckgo_url_extracts_target() -> None:
     url = normalize_duckduckgo_url("/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs")
 
     assert url == "https://example.com/docs"
+
+
+@pytest.mark.parametrize("symbol", ["aapl", "MSFT", "BRK.B", "7203.T"])
+def test_validate_stock_symbol_accepts_common_symbols(symbol: str) -> None:
+    assert validate_stock_symbol(symbol) == symbol.upper()
+
+
+@pytest.mark.parametrize("symbol", ["", "../AAPL", "AAPL MSFT", "$AAPL", "A" * 30])
+def test_validate_stock_symbol_rejects_invalid_symbols(symbol: str) -> None:
+    with pytest.raises(ValueError, match="Invalid stock symbol"):
+        validate_stock_symbol(symbol)

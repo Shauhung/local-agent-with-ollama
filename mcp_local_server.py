@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
 import ipaddress
 import re
-import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+import sys
 
+load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = (PROJECT_ROOT / "agent_workspace").resolve()
@@ -33,6 +35,7 @@ PACKAGE_SPEC_PATTERN = re.compile(
     r"(?:\[[A-Za-z0-9_,.-]+\])?"
     r"(?:(?:==|>=|<=|~=|!=|>|<)[A-Za-z0-9_.!*+:-]+)?"
 )
+STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,5}(\.[A-Z]{2,3})?$")
 PRIVATE_HOSTNAMES = {"localhost", "localhost.localdomain"}
 USER_AGENT = "local-ollama-mcp-agent/0.1"
 
@@ -72,6 +75,13 @@ def validate_package_spec(package: str) -> str:
     if not PACKAGE_SPEC_PATTERN.fullmatch(package):
         raise ValueError(f"Invalid package spec: {package}")
     return package
+
+
+def validate_stock_symbol(symbol: str) -> str:
+    symbol = symbol.strip().upper()
+    if not STOCK_SYMBOL_PATTERN.fullmatch(symbol):
+        raise ValueError(f"Invalid stock symbol: {symbol}")
+    return symbol
 
 
 class TextExtractor(HTMLParser):
@@ -274,25 +284,25 @@ def run_command(command: list[str], cwd: str = ".") -> dict[str, Any]:
     return compact_result(completed.stdout, completed.stderr, completed.returncode)
 
 
-@mcp.tool()
-def uv_add(package: str) -> dict[str, Any]:
-    """Add one Python package dependency to this project using uv."""
-    package = validate_package_spec(package)
-    uv_path = shutil.which("uv")
-    if uv_path is None:
-        raise ValueError("uv executable was not found in PATH")
+# @mcp.tool()
+# def uv_add(package: str) -> dict[str, Any]:
+#     """Add one Python package dependency to this project using uv."""
+#     package = validate_package_spec(package)
+#     uv_path = shutil.which("uv")
+#     if uv_path is None:
+#         raise ValueError("uv executable was not found in PATH")
 
-    completed = subprocess.run(
-        [uv_path, "add", package],
-        cwd=PROJECT_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        env={
-            "PATH": os.environ.get("PATH", ""),
-        },
-    )
-    return compact_result(completed.stdout, completed.stderr, completed.returncode)
+#     completed = subprocess.run(
+#         [uv_path, "add", package],
+#         cwd=PROJECT_ROOT,
+#         text=True,
+#         capture_output=True,
+#         timeout=120,
+#         env={
+#             "PATH": os.environ.get("PATH", ""),
+#         },
+#     )
+#     return compact_result(completed.stdout, completed.stderr, completed.returncode)
 
 
 @mcp.tool()
@@ -329,6 +339,97 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
             break
     return results
 
+
+@mcp.tool()
+def get_stock_quote_us(symbol: str) -> dict[str, Any]:
+    """Get the latest stock quote for a symbol using Finnhub.
+    
+    Only supports US stock. For example: AAPL, TSLA, MSFT, QQQ.
+    """
+    symbol = validate_stock_symbol(symbol)
+    api_key = os.environ.get("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("FINNHUB_API_KEY is not set")
+
+    url = f"https://finnhub.io/api/v1/quote?{urlencode({'symbol': symbol, 'token': api_key})}"
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    opener = build_opener(SafeRedirectHandler)
+
+    with opener.open(request, timeout=15) as response:
+        payload = json.loads(response.read(20000).decode("utf-8"))
+
+    timestamp = payload.get("t")
+    timestamp_utc = None
+    if isinstance(timestamp, int | float) and timestamp > 0:
+        timestamp_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+
+    return {
+        "symbol": symbol,
+        "price": payload.get("c"),
+        "change": payload.get("d"),
+        "percent_change": payload.get("dp"),
+        "high": payload.get("h"),
+        "low": payload.get("l"),
+        "open": payload.get("o"),
+        "previous_close": payload.get("pc"),
+        "timestamp_utc": timestamp_utc,
+        "source": "Finnhub",
+    }
+
+
+@mcp.tool()
+def get_stock_quote_tw(symbol: str) -> dict[str, Any]:
+        """Get the latest stock quote for a symbol using twse.
+    
+        Only supports TW stock. For example: 0050, 2330, 6669.
+        """
+        # 判斷是上市還是上櫃（台灣常見上櫃為4碼，有些特定權證或ETF是5碼）
+        # 這裡預設先查上市(tse)，若使用者有帶 .TWO 則切換為上櫃(otc)
+        market = "tse"
+        pure_symbol = symbol
+
+        if "." in symbol:
+            pure_symbol, suffix = symbol.split(".")
+            if suffix == "TWO":
+                market = "otc"
+        # https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_0050.tw
+        channel = f"{market}_{pure_symbol}.tw"
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={channel}"
+        print(f"DEBUG URL: {url}", file=sys.stderr)
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        opener = build_opener()
+        
+        with opener.open(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            
+        if not data.get("msgArray"):
+            # 如果上市查不到，自動嘗試切換到上櫃查一次（防呆）
+            if market == "tse":
+                channel = f"otc_{pure_symbol}.tw"
+                url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={channel}"
+                with opener.open(request, timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                
+        if not data.get("msgArray"):
+            return {"error": f"Taiwan stock symbol '{pure_symbol}' not found on TWSE/TPEx."}
+            
+        info = data["msgArray"][0]
+        
+        return {
+            "symbol": pure_symbol,
+            "name": info.get("n"),                      # 公司簡稱
+            "full_name": info.get("nf"),                 # 全名
+            "current_price_raw": info.get("z"),          # 當前成交價 (可能是 '-')
+            "yesterday_close_raw": info.get("y"),        # 昨收價
+            "open_raw": info.get("o"),                   # 開盤價
+            "high_raw": info.get("h"),                   # 最高價
+            "low_raw": info.get("l"),                    # 最低價
+            "volume_raw": info.get("v"),                 # 成交量
+            "trade_time": info.get("t"),                 # 台灣時間
+            "trade_date": info.get("d"),                 # 台灣日期
+            "source": "TWSE MIS (Raw snapshot for Agent analysis)",
+            "raw_msg": info                              # 甚至把整包塞進去讓 Agent 自己挖寶
+        }
 
 @mcp.tool()
 def create_tool_file(path: str, content: str) -> str:

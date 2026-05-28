@@ -7,41 +7,18 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import requests
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5-coder:32b"
 MAX_TOOL_ROUNDS = 30
-ACTION_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "object",
-    "oneOf": [
-        {
-            "properties": {
-                "type": {"const": "tool_call"},
-                "reason": {"type": "string"},
-                "tool": {"type": "string", "minLength": 1},
-                "arguments": {"type": "object"},
-            },
-            "required": ["type", "reason", "tool", "arguments"],
-            "additionalProperties": False,
-        },
-        {
-            "properties": {
-                "type": {"const": "final"},
-                "reason": {"type": "string"},
-                "answer": {"type": "string"},
-            },
-            "required": ["type", "reason", "answer"],
-            "additionalProperties": False,
-        },
-    ],
-}
 
 
 @dataclass
@@ -51,17 +28,30 @@ class ToolSpec:
     input_schema: dict[str, Any]
 
 
-@dataclass
-class AgentAction:
-    type: str
-    tool: str | None = None
-    arguments: dict[str, Any] | None = None
-    answer: str | None = None
-    reason: str | None = None
-
-
 class ActionValidationError(ValueError):
     """Raised when the model returns JSON that is valid but not a valid action."""
+
+
+class ToolCallAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["tool_call"]
+    reason: str = ""
+    tool: str = Field(min_length=1)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class FinalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["final"]
+    reason: str = ""
+    answer: str
+
+
+AgentAction = Annotated[ToolCallAction | FinalAction, Field(discriminator="type")]
+ACTION_ADAPTER = TypeAdapter(AgentAction)
+ACTION_RESPONSE_FORMAT: dict[str, Any] = ACTION_ADAPTER.json_schema()
 
 
 def json_default(value: Any) -> Any:
@@ -111,32 +101,12 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def parse_agent_action(raw: str) -> AgentAction:
     action = extract_json_object(raw)
-    action_type = action.get("type")
-
-    if action_type == "final":
-        answer = action.get("answer")
-        if not isinstance(answer, str):
-            raise ActionValidationError("final action requires string field 'answer'.")
-        reason = action.get("reason")
-        if reason is not None and not isinstance(reason, str):
-            raise ActionValidationError("action field 'reason' must be a string.")
-        return AgentAction(type="final", answer=answer, reason=reason)
-
-    if action_type == "tool_call":
-        tool = action.get("tool")
-        arguments = action.get("arguments")
-        reason = action.get("reason")
-        if not isinstance(tool, str) or not tool:
-            raise ActionValidationError("tool_call requires non-empty string field 'tool'.")
-        if arguments is None:
-            arguments = {}
-        if not isinstance(arguments, dict):
-            raise ActionValidationError("tool_call field 'arguments' must be an object.")
-        if reason is not None and not isinstance(reason, str):
-            raise ActionValidationError("action field 'reason' must be a string.")
-        return AgentAction(type="tool_call", tool=tool, arguments=arguments, reason=reason)
-
-    raise ActionValidationError("Action type must be 'tool_call' or 'final'.")
+    try:
+        return ACTION_ADAPTER.validate_python(action)
+    except ValidationError as exc:
+        if any(error.get("type") == "union_tag_invalid" for error in exc.errors()):
+            raise ActionValidationError("Action type must be 'tool_call' or 'final'.") from exc
+        raise ActionValidationError(str(exc)) from exc
 
 
 def build_system_prompt(tools: list[ToolSpec]) -> str:
@@ -182,6 +152,8 @@ def build_system_prompt(tools: list[ToolSpec]) -> str:
 - generated_tools 是實驗區。你可以在這裡建立工具與測試，但不能假設 generated_tools 裡的工具已經能在一般任務中直接使用。
 - 當 generated tool 的測試通過後，請停止並回覆使用者，說明工具已完成、測試狀態，以及需要人工 review/promote 後才可正式使用。
 - 需要最新或外部資訊時，先用 web_search 找公開來源，再用 fetch_url 讀取需要的頁面。
+- 使用者詢問今日或最新股價時，優先使用 get_stock_quote，並在回答中說明資料來源與時間戳。
+- 如果果使用者要查詢的是台股，優先使用 get_tw_stock_quote，並在回答中說明資料來源與時間戳。
 - 如果工具執行失敗，根據錯誤修正下一步。
 """.strip()
 
@@ -196,6 +168,17 @@ def build_ollama_payload(model: str, messages: list[dict[str, str]]) -> dict[str
             "temperature": 0.1,
         },
     }
+
+
+def build_final_history_message(answer: str) -> str:
+    return json.dumps(
+        {
+            "type": "final",
+            "reason": "Stored answer from earlier conversation history.",
+            "answer": answer,
+        },
+        ensure_ascii=False,
+    )
 
 
 def ask_ollama(model: str, messages: list[dict[str, str]]) -> str:
@@ -223,7 +206,12 @@ async def list_mcp_tools(session: ClientSession) -> list[ToolSpec]:
     return specs
 
 
-async def run_agent(user_input: str, model: str, trace_enabled: bool = False) -> str:
+async def run_agent(
+    user_input: str,
+    model: str,
+    trace_enabled: bool = False,
+    history_messages: list[dict[str, str]] | None = None,
+) -> str:
     server = StdioServerParameters(
         command=sys.executable,
         args=[str(PROJECT_ROOT / "mcp_local_server.py")],
@@ -236,6 +224,7 @@ async def run_agent(user_input: str, model: str, trace_enabled: bool = False) ->
             tools = await list_mcp_tools(session)
             messages = [
                 {"role": "system", "content": build_system_prompt(tools)},
+                *(history_messages or []),
                 {"role": "user", "content": user_input},
             ]
 
@@ -326,11 +315,19 @@ async def main() -> None:
         return
 
     print("Local Ollama MCP agent started. Type exit or quit to stop.")
+    history_messages: list[dict[str, str]] = []
     while True:
         user_input = input("\nUser: ").strip()
         if user_input.lower() in {"exit", "quit"}:
             break
-        answer = await run_agent(user_input, args.model, trace_enabled=args.trace)
+        answer = await run_agent(
+            user_input,
+            args.model,
+            trace_enabled=args.trace,
+            history_messages=history_messages[-20:],
+        )
+        history_messages.append({"role": "user", "content": user_input})
+        history_messages.append({"role": "assistant", "content": build_final_history_message(answer)})
         print(f"Agent: {answer}")
 
 

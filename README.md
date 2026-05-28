@@ -56,8 +56,10 @@ venv/bin/python local_agent_server.py --host 127.0.0.1 --port 8765
 ```bash
 curl -s http://127.0.0.1:8765/agent/message \
   -H 'content-type: application/json' \
-  -d '{"message":"列出 workspace 的檔案","trace":true}'
+  -d '{"session_id":"phone","message":"列出 workspace 的檔案","trace":true}'
 ```
+
+server 會用 SQLite 保存每個 `session_id` 的對話歷史，預設每次帶入最近 20 則訊息。
 
 ## 第一階段工具
 
@@ -72,6 +74,7 @@ curl -s http://127.0.0.1:8765/agent/message \
 - `uv_add`
 - `web_search`
 - `fetch_url`
+- `get_stock_quote`
 
 `read_file`、`write_file`、`search_files`、`run_command` 都限制在 `agent_workspace/` 裡。
 
@@ -86,6 +89,12 @@ curl -s http://127.0.0.1:8765/agent/message \
 `uv_add` 是專用依賴安裝工具，會在專案根目錄執行 `uv add <package>`，並只接受單一保守格式的 package spec，例如 `pydantic`、`pytest==9.0.3`、`requests[socks]`。
 
 `web_search` 和 `fetch_url` 提供連網能力，只允許公開 `http`/`https` URL，會拒絕 localhost、內網 IP、`.local` host 和帶帳密的 URL。
+
+`get_stock_quote` 會透過 Finnhub 查詢最新股價，需先設定：
+
+```bash
+export FINNHUB_API_KEY="你的 Finnhub API key"
+```
 
 ## 第二階段：自製工具與偵錯
 
