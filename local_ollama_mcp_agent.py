@@ -155,6 +155,7 @@ def build_system_prompt(tools: list[ToolSpec]) -> str:
 - 使用者詢問今日或最新股價時，優先使用 get_stock_quote，並在回答中說明資料來源與時間戳。
 - 如果果使用者要查詢的是台股，優先使用 get_tw_stock_quote，並在回答中說明資料來源與時間戳。
 - 如果工具執行失敗，根據錯誤修正下一步。
+- 如果歷史紀錄有相似的不要一直重複呼叫，回覆你遇到的問題以及可能的解決方式
 """.strip()
 
 
@@ -191,6 +192,26 @@ def ask_ollama(model: str, messages: list[dict[str, str]]) -> str:
     data = response.json()
     return data["message"]["content"]
 
+LLAMA_SERVER_URL = "http://localhost:8080/v1/chat/completions"
+
+def ask_llama_server(model: str, messages: list[dict[str, str]]) -> str:
+    # 2. 建立符合 OpenAI 規範的 Payload
+    payload = {
+        "model": model,          # llama-server 會忽略此欄位（因為已載入特定模型），但必須帶入
+        "messages": messages,    # 格式相同：[{"role": "user", "content": "你好"}]
+        "stream": False          # 關閉串流，直接返回完整文字
+    }
+    
+    response = requests.post(
+        LLAMA_SERVER_URL,
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+    data = response.json()
+    
+    # 3. 依照 OpenAI 的 JSON 結構層級解析文字
+    return data["choices"][0]["message"]["content"]
 
 async def list_mcp_tools(session: ClientSession) -> list[ToolSpec]:
     result = await session.list_tools()
@@ -229,7 +250,8 @@ async def run_agent(
             ]
 
             for round_index in range(1, MAX_TOOL_ROUNDS + 1):
-                raw = ask_ollama(model, messages)
+                # raw = ask_ollama(model, messages)
+                raw = ask_llama_server(model, messages)
                 messages.append({"role": "assistant", "content": raw})
 
                 try:

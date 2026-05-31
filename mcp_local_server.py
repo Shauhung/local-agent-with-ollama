@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 import sys
 
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -38,6 +43,13 @@ PACKAGE_SPEC_PATTERN = re.compile(
 STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{1,5}(\.[A-Z]{2,3})?$")
 PRIVATE_HOSTNAMES = {"localhost", "localhost.localdomain"}
 USER_AGENT = "local-ollama-mcp-agent/0.1"
+RECENCY_PARAMS = {
+    "any": None,
+    "day": "d",
+    "week": "w",
+    "month": "m",
+    "year": "y",
+}
 
 mcp = FastMCP("local-agent-tools")
 
@@ -158,6 +170,50 @@ def strip_html(text: str) -> str:
     return parser.text()
 
 
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_readable_html(html: str) -> dict[str, str]:
+    if BeautifulSoup is None:
+        return {
+            "title": "",
+            "description": "",
+            "text": strip_html(html),
+        }
+
+    soup = BeautifulSoup(html, "html.parser")
+    title = normalize_text(soup.title.get_text(" ")) if soup.title else ""
+    description = ""
+    description_tag = soup.find("meta", attrs={"name": "description"})
+    if description_tag and description_tag.get("content"):
+        description = normalize_text(str(description_tag["content"]))
+
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
+        tag.decompose()
+    for selector in ["nav", "header", "footer", "aside", "[role='navigation']"]:
+        for tag in soup.select(selector):
+            tag.decompose()
+
+    candidates = soup.select("article, main, [role='main']")
+    container = candidates[0] if candidates else soup.body or soup
+    parts: list[str] = []
+    for tag in container.find_all(["h1", "h2", "h3", "p", "li"], limit=250):
+        text = normalize_text(tag.get_text(" "))
+        if len(text) >= 20:
+            parts.append(text)
+    if not parts:
+        text = normalize_text(container.get_text(" "))
+    else:
+        text = normalize_text(" ".join(parts))
+
+    return {
+        "title": title,
+        "description": description,
+        "text": text,
+    }
+
+
 class SafeRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
         validate_public_url(newurl)
@@ -173,6 +229,67 @@ def normalize_duckduckgo_url(href: str) -> str:
     return absolute
 
 
+def build_duckduckgo_search_url(query: str, recency: str = "any", search_type: str = "web") -> str:
+    query = query.strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    recency = recency.strip().lower()
+    if recency not in RECENCY_PARAMS:
+        raise ValueError(f"Invalid recency: {recency}")
+    search_type = search_type.strip().lower()
+    if search_type not in {"web", "news"}:
+        raise ValueError(f"Invalid search_type: {search_type}")
+
+    params = {"q": query}
+    if RECENCY_PARAMS[recency]:
+        params["df"] = RECENCY_PARAMS[recency]
+    if search_type == "news":
+        params["iar"] = "news"
+        params["ia"] = "news"
+    return f"https://duckduckgo.com/html/?{urlencode(params)}"
+
+
+def parse_duckduckgo_results(html: str, max_results: int) -> list[dict[str, str]]:
+    max_results = max(1, min(max_results, 10))
+    parsed_results: list[dict[str, str]] = []
+
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html, "html.parser")
+        result_nodes = soup.select(".result")
+        for node in result_nodes:
+            link = node.select_one("a.result__a") or node.select_one("a[href]")
+            if not link or not link.get("href"):
+                continue
+            title = normalize_text(link.get_text(" "))
+            if not title:
+                continue
+            snippet_node = node.select_one(".result__snippet")
+            snippet = normalize_text(snippet_node.get_text(" ")) if snippet_node else ""
+            parsed_results.append(
+                {
+                    "title": title,
+                    "url": str(link["href"]),
+                    "snippet": snippet,
+                }
+            )
+            if len(parsed_results) >= max_results:
+                return parsed_results
+
+    parser = DuckDuckGoResultParser()
+    parser.feed(html)
+    for result in parser.results:
+        parsed_results.append(
+            {
+                "title": result["title"],
+                "url": result["url"],
+                "snippet": "",
+            }
+        )
+        if len(parsed_results) >= max_results:
+            break
+    return parsed_results
+
+
 def fetch_public_url_text(url: str, max_chars: int, readable_html: bool) -> dict[str, Any]:
     url = validate_public_url(url)
     max_chars = max(500, min(max_chars, 30000))
@@ -186,12 +303,19 @@ def fetch_public_url_text(url: str, max_chars: int, readable_html: bool) -> dict
         raw = response.read(max_chars * 4)
 
     text = raw.decode(charset, errors="replace")
+    title = ""
+    description = ""
     if readable_html and "html" in content_type:
-        text = strip_html(text)
+        extracted = extract_readable_html(text)
+        title = extracted["title"]
+        description = extracted["description"]
+        text = extracted["text"]
 
     return {
         "url": final_url,
         "content_type": content_type,
+        "title": title,
+        "description": description,
         "text": text[:max_chars],
     }
 
